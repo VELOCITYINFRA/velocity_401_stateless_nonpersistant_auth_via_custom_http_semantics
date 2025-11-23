@@ -27,6 +27,8 @@ import json
 import httpx
 from diskcache import Cache
 from pathlib import Path
+import jwt
+
 
 
 
@@ -116,11 +118,33 @@ def TokenCheck(walletPublicKey,api_key,mint,mint_amount):
 
 
 
+def generateJWT(wallet, tokenname,scopes):
+
+    try:
+    
+        payload = {
+            "sub": wallet,
+            "scopes": scopes,
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 86400
+        }
+
+        token = jwt.encode(payload, tokenname, algorithm="HS256")
+
+        return token
+    except Exception as e:
+         
+        return None
+
+
+
+
+
 
 class VelcoityTuned401(BaseHTTPMiddleware):
 
 
-    def __init__(self, app, protected_paths:dict,required_mint:str,mint_amount:float,helius_api_key:str,secret_domain,turn_on_one_time_access_per_wallet:bool):
+    def __init__(self, app, protected_paths:dict,required_mint:str,mint_amount:float,helius_api_key:str,secret_domain,turn_on_one_time_access_per_wallet:bool,options={}):
         super().__init__(app)
         self.protected_paths = protected_paths
         self.required_mint = required_mint
@@ -128,8 +152,11 @@ class VelcoityTuned401(BaseHTTPMiddleware):
         self.helius_api_key = helius_api_key
         self.secret_domain = secret_domain
         self.turn_on_one_time_access_per_wallet=turn_on_one_time_access_per_wallet
+        self.options=options
         self.gate_storage=   Cache(str(ROOT_CACHE_DIR / "gate"))
         self.custom_storage = Cache(str(ROOT_CACHE_DIR / "custom"))
+        self.jwt_storage=Cache(str(ROOT_CACHE_DIR/"jwt"))
+                
       
   
       
@@ -152,6 +179,15 @@ class VelcoityTuned401(BaseHTTPMiddleware):
 
     def checkCustomStorage(self,wallet):
         return wallet in self.custom_storage
+
+
+
+    def addtoJWTStorage(self,wallet):
+        self.jwt_storage[wallet] = True
+
+
+    def checkJWTStorage(self,wallet):
+        return wallet in self.jwt_storage
 
 
 
@@ -277,26 +313,86 @@ class VelcoityTuned401(BaseHTTPMiddleware):
                                 return response
                          
 
-                            case "custom":
+                             case "custom":
                               
-                                if self.turn_off_one_time_access_per_wallet==False:
+                                if self.turn_on_one_time_access_per_wallet==True:
                                   
-                                    checkstatus=self.checkCustomStorage(X_401_Addr)
+                                                checkstatus=self.checkCustomStorage(X_401_Addr)
+                                                if checkstatus==True:
+
+                                                return JSONResponse(
+                                                        content={"status": "error", "message": f"one time access already granted for {X_401_Addr}"},
+                                                        headers= {
+                                                            "Access-Control-Allow-Origin": "*",
+                                                            "Access-Control-Allow-Credentials": "true"
+                                                        },
+                                                        status_code=401
+                                                        )
+                                
+                                 self.addtoCustomStorage(X_401_Addr)
+                                 response = await call_next(request)
+                                 return response
+
+                             case "jwt":
+                                   if self.turn_on_one_time_access_per_wallet==True:
+                                  
+                                    checkstatus=self.checkJWTStorage(X_401_Addr)
                                     if checkstatus==True:
 
                                         return JSONResponse(
-                                            content={"status": "error", "message": f"access already granted for {X_401_Addr}"},
+                                            content={"status": "error", "message": f"one time access already granted for {X_401_Addr}"},
                                             headers= {
                                                 "Access-Control-Allow-Origin": "*",
                                                 "Access-Control-Allow-Credentials": "true"
                                             },
-                                            status_code=401
+                                            status_code=500
+                                            )  
+
+                                    jwt_token = generateJWT(X_401_Addr,"jwtaccesstoken",self.options.get("context", {}).get("scopes"))
+                                    self.addtoJWTStorage(X_401_Addr)
+                                    if jwt_token is None:
+
+                                          return JSONResponse(
+                                             content={"status": "error", "message": f"Failed to create token "},
+                                             headers={
+                                               "Access-Control-Allow-Origin": "*",
+                                               "Access-Control-Allow-Credentials": "true"
+                                         },
+                                        status_code=500
+                                         )
+
+                                    if response.headers.get("content-type") == "application/json":
+        
+                                        body_bytes = b""
+                                        async for chunk in response.body_iterator:
+                                                body_bytes += chunk
+
+                                        try:
+                                            data = json.loads(body_bytes.decode())
+                                        except json.JSONDecodeError:
+        
+                                            return response
+
+        
+                                        data["jwttoken"] = jwt_token
+        
+        
+                                        response_headers = dict(response.headers)
+                                        response_headers.pop("content-length", None)
+                                        print(data) 
+
+                                        return JSONResponse(
+                                                content=data,
+                                                status_code=response.status_code,
+                                                headers=response_headers
                                             )
                                 
-                                self.addtoCustomStorage(X_401_Addr)
-                                response = await call_next(request)
-                                return response
-                                                    
+                                   return response
+
+                
+                                                
+            
+                  
 
             elif tokenverify==False:
                         return JSONResponse(
